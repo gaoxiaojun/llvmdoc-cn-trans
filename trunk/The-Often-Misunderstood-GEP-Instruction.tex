@@ -1,0 +1,153 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{graphicx}
+\usepackage{xeCJK}
+\setmainfont{SimSun}
+\title{常误解的GEP指令}
+\author{原作者：Reid Spencer\\译者：张祖羽@HEU\\译文版本：0.11}
+
+\begin{document}
+\maketitle
+
+\section{简介}
+
+该文档用于解决围绕LLVM GetElementPtr（GEP）指令的迷惑。关于wiley GEP指令的问题可能是开发者进行LLVM编程时最常遇到的问题。这里我们展示迷惑的源码，显示出GEP指令相当简单。
+
+\section{问题}
+
+当人们首次遇到GEP指令时，他们试图将其与其它编程范例的熟知概念（C数组索引和域选取）联系起来。然而GEP稍有差异，且这导致以下问题；所有这些问题在下面的部分有解答。
+
+\subsection{什么是GEP指令的首个索引？}
+
+快速解答：首个操作数跨步的索引。
+
+首个索引的迷惑通常是认为GetElementPtr指令就像C索引操作。它们不一样。例如，当我们写"C"代码时：
+
+AType *Foo;
+...
+X = \&Foo->F;
+
+认为这仅有一个索引（域F的选取）是自然的想法。但是在本例，Foo是个指针。该指针在LLVM必须显式索引。而C则是通过指针透明索引。为像C代码一样到达同一地址位置，需提供带有两个索引操作数的GEP指令。首个操作数索引指针；第二个操作数索引结构的域F，如下：
+
+X = \&Foo[0].F;
+
+有时本问题如下描述：
+为什么可以通过首个指针索引，而后继指针却不能间接引用（dereference）？
+
+答案很简单，因为执行计算时没必要访存。GEP指令的首个操作数必须是指针类型的值。直接提供给GEP指令的指针值作为操作数，无需访存。因此该指令需要索引操作数。考虑这个示例：
+
+struct munger\_struct {
+  int f1;
+  int f2;
+};
+void munge(struct munger\_struct *P) {
+  P[0].f1 = P[1].f1 + P[2].f2;
+}
+...
+munger\_struct Array[3];
+...
+munge(Array);
+
+在每个示例中，首个操作数是GEP指令起始的指针。无论首个操作数是参数、分配的内存，或是全局变量，都是一样的。
+
+为弄清楚，让我们考虑更简单（obtuse）的示例：
+
+\%MyVar = unintialized global i32
+...
+\%idx1 = getelementptr i32* \%MyVar, i64 0
+\%idx2 = getelementptr i32* \%MyVar, i64 1
+\%idx3 = getelementptr i32* \%MyVar, i64 2
+
+这些GEP指令简单地完成基于MyVar基址的地址计算。指令如下计算（使用C语法）：
+
+idx1 = (char*) \&MyVar + 0
+idx2 = (char*) \&MyVar + 4
+idx3 = (char*) \&MyVar + 8
+
+既然i32类型是熟知的4字节长度，索引 0, 1 和 2 分别翻译成内存偏移 0, 4 和 8。完成这些计算时没有访存，是因为 \%MyVar 的地址是直接传递给 GEP 指令的。
+
+该示例的简单部分在于 \%idx2 和 \%idx3 。上述变量产生地址（指向全局值 \%MyVar 尾部内存的地址）计算，计算结果仅有一个i32长度而非3个i32长度。虽然在LLVM这是合法的，但不建议使用，因为利用GEP指令产生的指针的load和store将出现未定义的结果。
+
+\subsection{为什么需要额外的0索引？}
+
+快速解答：这没有多余的索引。
+
+该问题是由GEP指令应用在总是指针类型的全局变量时引起的。例如，考虑这个：
+
+Struct = uninitialized global { float*, i32 }
+...
+\%idx = getelementptr { float*, i32 }* \%MyStruct, i64 0, i32 1
+
+上述GEP指令产生由 \%MyStruct 结构的 i32 类型域 索引的 i32*。当首次见到此指令时，会疑惑为什么需要 i64 0索引。然而，对全局值和GEP指令怎样工作的进一步认识显示该需求。对下面事实的理解可解决迷惑：
+
+\begin{enumerate}
+\item \%MyStruct 的类型是 { float*, i32}* 而非 { float*, i32}。那就是说， \%MyStruct 是指向结构的指针，该结构包含指向float的指针和i32。
+\item 第一条由此证明：注意GEP指令首个操作数（\%MyStruct）的类型是 {float*, i32}* 。
+\item 需要首个索引（i64 0）以明确全局变量 \%MyStruct 的跨步。既然GEP指令的首个参数必须总是指针类型的值，首个索引通过指针跨步。0值意味着该指针的0元素偏移。
+\item 第二个索引， i32 1选择结构的第二个域（i32）。
+\end{enumerate}
+
+\subsection{什么可由GEP间接引用？}
+
+快速解答：任何值都不可以。
+
+GetElementPtr指令不能间接引用任何值。那就是说，该指令任何时候都不访存。那是由 load 和 store 指令完成的。GEP指令仅在地址计算时涉及（involve）。例如，考虑这样：
+
+\%MyVar = uninitialized global { [40 x i32 ]* }
+...
+\%idx = getelementptr { [40 x i32]* }* \%MyVar, i64 0, i32 0, i64 0, i64 17
+
+本例中，全局变量 \%MyVar 是指向结构的指针，该结构包含指向40个整数数组的指针。GEP指令似乎是访问结构的整数数组中第18个整数。然而，这是个完全非法的GEP指令。它不能通过编译。其原因是结构的指针必须间接引用，以索引40个整数的数组。既然GEP指令永不访存，这是非法的。
+
+为了访问数组的第18个整数，需要如下实现：
+
+\%idx = getelementptr { [40 x i32]* }* \%, i64 0, i32 0
+\%arr = load [40 x i32]** \%idx
+\%idx = getelementptr [40 x i32]* \%arr, i64 0, i64 17
+
+既然这样，不得不在索引数组前，使用 load 指令加载结构的指针。如果示例改变了：
+
+\%MyVar = uninitialized global { [40 x i32 ] }
+...
+\%idx = getelementptr { [40 x i32] }*, i64 0, i32 0, i64 17
+
+则一切工作地很好。既然这样，不包含指针的结构和GEP指令可通过全局变量，索引结构的首个域，并访问数组的第18个i32。
+
+\subsection{为什么不将 GEP x,0,0,1 别名为 GEP x,1 ？}
+
+快速解答：他们计算不同的地址位置。
+
+如果查看这些GEP指令的首个索引，会发现它们是不同的（0 和 1），因此地址计算因索引而不同。考虑该示例：
+
+\%MyVar = global { [10 x i32 ] }
+\%idx1 = getlementptr { [10 x i32 ] }* \%MyVar, i64 0, i32 0, i64 1
+\%idx2 = getlementptr { [10 x i32 ] }* \%MyVar, i64 1
+
+该示例中， idx1 计算 \%MyVar 结构的数组第二个整数的地址，其值为 MyVal + 4 。idx1 的类型是 i32* 。然而， idx2计算 \%MyVar 后的下个结构地址。 idx2 的类型是 { [10 x i32] }* ，且其值等价于 MyVal + 40， 因为索引经过 MyVar 的 10 个 4 位整数。显然，这种情况下，指针不能别名。
+
+\subsection{为什么将 GEP x,1,0,0 别名为 GEP x,1 ？}
+
+快速解答：它们计算同一地址位置。
+
+这两个GEP指令将计算同一地址位置，因为通过第0个元素的索引不改变地址。然而，这确实改变类型。考虑该示例：
+
+
+\%MyVar = global { [10 x i32 ] }
+\%idx1 = getlementptr { [10 x i32 ] }* \%MyVar, i64 1, i32 0, i64 0
+\%idx2 = getlementptr { [10 x i32 ] }* \%MyVar, i64 1
+
+该示例中， \%idx1的值是 \%MyVar + 40，且其类型是 i32* 。\%idx2 的值也是 MyVal + 40 ，但其类型是 { [10 x i32] }* 。
+
+\section{总结}
+
+总之，这是关于 GetElementPtr 指令需要记住的一些事情：
+
+\begin{enumerate}
+\item GEP指令永不访存，它仅提供指针计算。
+\item GEP指令的首个操作数总是指针，且必须索引。
+\item GEP指令没有多余的索引。
+\item 后面的零索引对指针别名是多余的，但对于指针类型并非如此。
+\item 首个的零索引对指针别名和指针类型都不是多余的。
+\end{enumerate}
+
+\end{document}

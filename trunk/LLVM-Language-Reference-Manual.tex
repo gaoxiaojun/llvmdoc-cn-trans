@@ -1,0 +1,2089 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage{fontspec}
+\usepackage{graphicx}
+\usepackage{xeCJK}
+\setmainfont{SimSun}
+\title{LLVM语言参考指南}
+%\author{张祖羽\\@CS.HEU}
+
+\begin{document}
+\maketitle
+
+\section{摘要}
+
+该文档是LLVM汇编语言的参考指南。LLVM是基于表示的静态单赋值（SSA），该表示提供类型安全、低层级操作，灵活性，及简洁表示所有高层级语言的能力。这是贯穿各方面LLVM编译策略的通用代码表示。
+
+\section{简介}
+
+LLVM代码表示用于三个不同形式：作为在内存（in-memory）编译器IR、磁盘比特码表示（适合即时编译器的快速加载），以及人类可读的汇编语言表示。这让LLVM为高效编译器转换和分析提供强大的中间表示的同时，提供调试和转换可视化的自然手段。LLVM的三种不同形式是等价的。该文档描述了人类可读的表示和注解。
+
+LLVM表示旨在具有易于表达、类型化和扩展性的同时保持轻量级和低层级。它通过处于可清晰映射高层想法的足够低的层级（类似于微处理器允许许多源语言映射其上而成为通用IR），使其成为通用IR。通过提供类型信息，LLVM可用于优化的目的：例如，通过指针分析，可证明C自动变量永远不会访问当前函数以外的部分...允许其使用简单的SSA以代替内存位置。
+
+\subsection{规范化}
+
+记住，该文档描述的是规范化的LLVM汇编语言，这很重要。语法分析器的接受范围与规范化之间有所差异。例如，下列指令句法通顺，但不够规范化：
+
+\%x = add i32 1, \%x
+
+...因为\%x的定义不能控制自身的所有使用。LLVM基础架构提供验证LLVM模块是否规范化的验证pass。在语法分析输入的汇编后由语法分析器和在其输出比特码前由优化器自动运行该pass。验证pass指出的违反行为指名了转换pass或语法分析器输入的bug。
+
+\section{标识符}
+
+LLVM标识符具有两种基本类型：全局和局部。全局标识符（函数，全局变量）以'@'起始。局部标识符（寄存器名字，类型）以'\%'起始。另外，标识符针对不同目的有三种不同格式：
+
+\begin{itermize}
+\item 命名值表示为字符串及其前缀。例如，\%foo, @DivisionByZero, \%a.really.long.identifier。实际的正则表达式是'[\%@][a-zA-Z$.\_][a-zA-Z$.\_0-9]*'。在其名字里需要其它字符的标识符会被引用环绕。特殊字符可使用"\\xx"表示，其中xx是字符ASCII码的16进制表示。这样，所有字符可用于命名值，甚至引用自身。
+\item 未命名值利用无符号数值及其前缀表示。例如，\%12, @2, \%44。
+\item 常量，在下面的章节“常量”中描述。
+\end{itermize}
+
+LLVM需要以前缀起始取值有两个原因：编译器无需担心保留字的命名冲突，而且保留字的集合可在未来无惩罚地扩展。另外，未命名标识符允许编译器无需刻意避免符号表冲突而快速使用临时变量。
+
+LLVM保留字与其它语言非常相似。关键字包括不同操作码（add， bitcast，ret等），基本类型名（void，i32等）和其它。这些保留字不会与变量名冲突，因为前者都不以前缀字符（'\%'或'@'）起始。
+
+这是整数变量'\%x'乘以8的LLVM代码示例。
+
+简单方式：
+
+\%result = mul i32 \%x, 8
+
+简化之后：
+
+\%result = shl i32 \%x, i8 3
+
+复杂方式：
+
+add i32 \%x, \%x    ;生成{i32}:\%0
+add i32 \%0, \%0    ;生成{i32}:\%1
+\%result = add i32 \%1, \%1
+
+最后一种实现\%x乘以8的方式表明LLVM许多重要词法特点：
+
+\begin{iterator}
+\item 注释以';'界定，直到行尾。
+\item 当计算结果未赋值给命名变量时，创建未命名临时变量。
+\item 未命名临时变量顺序编号。
+\end{iterator}
+
+...还表明该文档中遵循的习惯。当展示指令时，指令之后是定义生成值类型和命名的注释。注释以italic文本呈现。
+
+\section{高层结构}
+
+\subsection{模块结构}
+
+LLVM程序是由"模块"组成的，每个模块是输入程序的一个转换单元。每个模块包括函数、全局变量和符号表入口。模块可由LLVM链接器组合在一起，这将合并函数（全局变量）的定义，解析之后的声明，并合并符号表入口。这是"hello world"模块的示例：
+
+; 声明string常量作为全局常量
+@.LC0 = internal constant [13 x i8] c"hello world\0A\00"          ; [13 x i8]*
+
+; puts函数的外部声明
+declare i32 @puts(i8 *)                                           ; i32(i8 *)*
+
+; main函数的定义
+define i32 @main() {                                              ; i32()*
+        ; Convert [13 x i8]* to i8  *...
+        \%cast210 = getelementptr [13 x i8]* @.LC0, i64 0, i64 0   ; i8 *
+
+        ; Call puts function to write out the string to stdout...
+        call i32 @puts(i8 * \%cast210)                             ; i32
+        ret i32 0
+}
+
+本例由全局变量".LC0"，puts函数的外部声明和main的函数定义组成。
+
+通常地，模块由一系列的全局值组成，其中函数和全局变量都是全局值。全局值以指向内存位置的指针（因此，指向字符数组的指针，指向函数的指针）表示，并具有下列链接类型的一种。
+
+\subsection{链接类型}
+
+所有全局变量和函数具有下列链接类型之一：
+
+\begin{description}
+\item[private] 具有私有链接的全局值只能被当前模块的对象直接访问。特别地，具有私有全局值模块的链接代码可能在必要时导致对私有部分重命名，以避免冲突。由于该符号对模块是私有的，所有引用会被更新。这并不会在目标文件的任何符号表有所显示。
+\item[linker\_private] 类似私有链接，但该符号通过汇编器并由链接器在求值后移除。
+\item[internal] 类似私有链接，但其值在目标文件中显示为局部符号（ELF文件格式的STB\_LOCAL）。这对应C语言的static关键字。
+\item[available\_externally] 具有"有效外部"链接的全局值不会引入到LLVM模块对应的目标文件。它们的存在是为进行内联和其它优化时告知位于模块外的全局值定义具体位置。具有有效外部链接的全局值可随意=丢弃，否则与linkconce\_odr链接类型一样。该链接类型只能定义不能声明。
+\item[linkonce] 具有"仅链接一次"链接的全局值在链接发生时，与同名的其它全局值合并。这典型地用实现内联函数，模板或在每个使用该链接的转换单元中生成的其它代码。未引用的linkonce全局值可丢弃。
+\item[weak] "弱"链接与linkonce链接具有相同的合并语法，除未引用的弱链接全局值不丢弃外。这用于C源码中声明为"weak"的全局值。
+\item[common] "通用"链与"弱"链接极其相似，但它们用于C的定义，例如全局作用域的"int X;"。"通用"链接的符号与weak符号一样，以同样的方式合，而且若未引用，该链接可能也不会删除。通用符号可没有显式段，但必须零初始化，且可能未标记为'constant'。函数和别名可能没有通用链接。
+\item[appending] "附加"链接只用于指向数组类型的全局变量。两个具有appending链接的全局变量链接在一起时，两个全局数组附加在一起。这就是在链接.o文件时LLVM系统链接器将相同名称的“段”附加在一起的类型安全和等性。
+\item[extern\_weak] 该链接的语法含义遵循ELF目标文件模型：该符号直到进行链接是才是weak类型，如果未链接，该符号会用null替代未定义的引用。
+\item[linkonce\_odr] 
+\item[weak\_odr] 一些语言允许不同的全局值进行合并，例如不同语义的两个函数。其它语言，例如C++，保证只有等价的全局值才能合并（"一次定义规则"-"ODR"）。这样的语言可使用linkonce\_odr和weak\_odr链接类型以表明只有等价的全局值才能合并。这些链接类型在其它方面与非odr版本具有相同属性。
+\item[externally visible] 若以上标识符都没有使用，全局值则是外部可见的，这意味全局值参与链接并可用于解析外部符号引用。
+\end{description}
+以下两种链接类型仅针对微软Windows平台。它们为支持从DLL（Dynamic Link Library）引入符号（或导出符号至DLL）而设计。
+\begin{description}
+\item[dllimport] "dllimport"链接导致编译器通过由DLL导出符号建立的指向指针的全局指针，引用函数或变量。
+\item[dllexport] "dllexport"链接导致编译器提供DLL中指向指针的全局指针，以使该全局值可利用dllimport属性引用。在微软Windows目标平台，指针通过联合\_\_imp\_和函数或变量名的形式命名。
+\end{description}
+
+例如，".LC0"变量定义为interal，如果其它模块定义了".LC0"变量且该变量被链接，两者之一将被重命名以避免冲突。既然"main"和"puts"是external类型（比如缺少链接声明），它们可在当前模块外被访问。
+
+除了"外部可见"，dllimport或extern\_weak外，函数声明的其它链接类型都是不合法的。
+
+别名仅有external, internal, weak或weak\_odr链接。
+
+\subsection{调用约定}
+
+LLVM的函数，call和invoke都可为指定的调用设定可选的调用约定。动态调用者/被调用者配对的调用约定必须匹配，否则程序行为未定义。LLVM支持下列调用约定，且可能在将来有所增加。
+
+\begin{description}
+\item["ccc" - C调用约定] 该调用约定（如果没有指定其它调用约定，默认使用该调用约定）匹配目标平台的C调用约定。它支持可变参数（varargs）函数调用，并容忍函数原型声明和声明实现的一些误配（就像正常C行为）。
+\item["fastcc" - 快速调用约定] 该调用约定试图使调用尽可能快（例如通过寄存器传值）。它允许目标平台使用任何小技巧以产生该平台的快速代码，而无需与外部指定的ABI（Application Binary Interface）保持一致。其实现支持任意的推后调用优化（tail call optimization）。它不支持可变参数，且要求所有被调用者的原型与函数定义的原型完全匹配。
+\item["coldcc" - 生冷的调用约定] 该调用约定基于调用不常执行这一假定，试图使调用者的代码尽可能有效。因此，这些调用常保护所有寄存器，以致调用不会破坏调用者边界的任何数据区域。它不支持可变参数，且要求所有被调用者的原型与函数定义的原型完全匹配。
+\item["cc <n>" - 编号约定] 所有调用约定可通过编号指定，可用于目标平台相关的调用约定。目标平台相关的调用约定从64开始编号。
+\end{description}
+
+更多的调用约定可按需增加/定义，以支持Pascal约定或所有其它熟知的与目标平台无关的约定。
+
+\subsection{可见性样式}
+
+所有全局变量和函数具有下列可见性样式之一：
+
+\begin{description}
+\item["default" - 默认样式] 在使用ELF目标文件格式的目标平台上，默认可见性意味着声明对其它模块可见，对于共享库意味着声明实体可被覆盖（override）。对于Darwin平台，默认可见性意味着声明可对其它模块可见。默认可见性对应语言的"外部链接"。
+\item["hidden" - 隐藏样式] 如果具有隐藏样式对象的两个声明位于同一共享目标文件时，它们引用同一目标。隐藏可见性通常表明，符号不会位于动态符号表，因此没有其它模块（可执行或共享库）能直接引用该符号。
+\item["protected" - 保护样式] ELF的保护可见性表明，符号将会位于动态符号表，但在定义模块内的引用会绑定为局部符号。也就是说，该符号不会被其它模块覆盖。
+\end{description}
+
+\subsection{命名类型}
+
+LLVM IR允许对确定类型指定别名。这可使IR更可读和更紧凑（condense）（特别是涉及递归类型时）。下面是命名规范的示例：
+
+\%mytype = type { \%mytype*, i32 }
+
+除"void"外可以给定所有类型命名。类型名字别名可用于任何识别到"\%mytype"语法的地方。
+
+记住，针对指定结构的类型进行类型名字别名，而且你还能对同一类型指定不同名字。当输出.ll文件时，这常导致混淆的行为。既然LLVM IR使用结构的类型，名字就不是类型的一部分。当输出LLVM IR时，打印器（printer）将挑选一个名字以返回（render）特有形状的所有类型。这意味着，如果对以同一LLVM类型结尾的不同源类型进行编码，输出器（dumper）有时输出"错误"或意外的类型。这是重要的设计观点，且不会改变。
+
+\subsection{全局变量}
+
+全局变量定义了在编译期而非运行期的内存分配区域。它可被任意值初始化，可位于显式段（section），还具有可选的显式指定对齐。变量可定义为"thread\_local"，这意味它不会被线程共享（每个线程将具有它的独立拷贝）。变量也可定义为全局"常量"，这表明它的内容永不会被修改（允许更好的优化，可将全局数据位于执行代码的只读段等）。记住，需要在运行时初始化的变量不能标记为"常量"，是因为它有存储空间。
+
+LLVM显式允许全局变量的声明标记为常量，甚至它的最终定义并非如此。这可用于使程序优化效果好一些，但需要语言定义以保证基于'constantness'的优化对并不包含定义的转换单元有效。
+
+如SSA赋值，全局变量定义程序中具有所有基本块作用域（例如指针指向的）的指针值。它总定义至其"内容"类型的指针，是因为后者描述了内存区域和可通过指针访问的所有LLVM内存目标。
+
+全局变量可声明位于目标平台相关的计数地址空间。对于支持以上操作的目标平台，地址空间可能会影响优化器的执行和/或可访问该变量的目标平台指令。默认的地址空间是零。地址空间的限制必须处于其它属性之前。
+
+LLVM允许指定针对全局值的显式段。如果目标平台支持的话，LLVM将发射全局值至指定段。
+
+还可对全局值指定显式的对齐。如果没设置，或是对齐设为零，全局值的对齐将设置为目标平台方便的值。如果指定了显式对齐，全局值强制具有至少指定的对齐值。所有对齐必须为2的幂。
+
+例如，下列定义了位于计数地址空间的全局值，具有初始器，段和对齐：
+
+@G = addrspace(5) constant float 1.0, section "foo", align 4
+
+\subsection{函数}
+
+LLVM函数定义由"define"关键字、可选的链接类型、可选的可见样式、可选的调用惯例、返回类型、可选的返回类型参数属性、函数名称、（可能为空的）参数列表（每一个参数都有可选的参数属性）、可选的函数属性、可选的段、可选的对齐、可选的垃圾回收器、打开的花括号、基本块列表和封闭的花括号组成。
+
+LLVM函数声明由"declare"关键字、可选的链接类型、可选的可见样式、可选的调用惯例、返回类型、可选的返回类型参数属性、函数名称、可能为空的参数列表、可选的对齐和可选的垃圾回收器组成。
+
+函数定义包含基本块列表以形成该函数的CFG（控制流图）。每个基本块可选地以标号（给出基本块的符号表入口）起始，包含指令列表，并以终止指令（例如跳转或函数返回）结束。
+
+函数的第一个基本块有两点特殊性：进入函数时直接执行，且不允许具有前趋基本块（例如，函数入口的块不能有任何分支）。因为该块没有前趋，它同样没有任何PHI节点。
+
+LLVM允许为函数指定显式段。如果目标平台支持的话，LLVM将函数置于指定的段。
+
+对函数可指定显式的对齐。如果未设置，或是对齐设置为零，函数的对齐会设置为目标平台方便的值。如果指定显式的对齐，函数强制至少具有指定的对齐。所有对齐必须是2的幂。
+
+语法：
+
+define [linkage] [visibility] [cconv] [ret attrs] <ResultType> @<FunctionName> ([argument list]) [fn Attrs] [section "name"] [align N] [gc] { ... }
+
+\subsection{别名}
+
+别名作为被别名值（the aliasee value）（可为函数、全局变量、另一个别名或全局值的位转换）的"第二名称"。别名可具有可选的链接类型和可选的可见样式。
+
+语法：
+
+@<Name> = alias [Linkage] [Visibility] <AliaseeTy> @<Aliasee>
+
+\subsection{参数属性}
+
+返回类型和函数类型的每个参数可具有与其相关的参数属性集合。参数属性用于表达函数结果或参数的额外信息。参数属性被认为是函数而非函数类型的一部分，因此具有不同参数属性的函数可具有同一函数类型。
+
+参数属性是遵循指定类型的简单关键字。如果需要多个函数属性，则以空格分隔。例如：
+
+declare i32 @printf(i8* noalias nocapture, ...)
+declare i32 @atoi(i8 zeroext)
+declare signext i8 @returns\_signed\_char()
+
+记住，函数结果（nounwind，只读）的任何属性直接位于参数列表后。
+
+当前，只定义了下列参数属性：
+
+\begin{description}
+\item[zeroext] 这表明，代码生成器中调用者或被调用者分别将参数或返回值零扩展为32位值。
+\item[signext] 这表明，代码生成器中调用者或被调用者分别将参数或返回值符号扩展为32位值。
+\item[inreg] 这表明，在函数调用或返回生成代码期间（通常，将变量置于与内存相对的寄存器中，但是目标平台使用这种方式以区别寄存器的两种不同类型），参数或返回值被视为处于特殊的目标平台无关方式。该属性的使用是目标平台相关的。
+\item[byval] 这表明，指针参数应以传值方式传至函数。该属性指出，调用者和被调用者间将导致被指向单元（pointee）的隐形复制，因此被调用者不能修改调用者的值（原文有笔误：so the callee is unable to modify the value in the callee，应为in the caller）。该属性只对LLVM指针参数有效。这通常用于传值方式传递结构和数组，但对指向标量的指针同样有效。上述复制被认为是属于调用者而非被调用者（例如，只读函数不应写具有byval属性的参数）。这不是返回值的有效属性。byval属性也支持由align属性指定的对齐。这对代码生成器有与目标平台相关的影响，这通常表明生成的栈槽（stack slot）需要对齐。
+\item[sret] 这表明，指针参数指定了源程序的函数返回值结构的地址。该指针必须由调用者保证有效：加载和存储该结构假定被调用者不会进入陷阱（trap）。这只可能应用与第一个参数。这不是返回值的有效属性。
+\item[noalias] 这表明，该指针不能别名一切全局值或其它任何参数。调用者有责任保证符合上述情况。对于函数返回值，noalias还表明指针不能别名为其它任何对调用者可见的指针。更多的细节请参见别名分析中NoAlias回复的讨论。
+\item[nocapture] 这表明，被调用者不产生比被调用者本身生命周期长的指针的任何复制。这不是返回值的有效属性。
+\item[nest] 这表明，指针参数可通过使用trampoline intrinsics引用。这不是返回值的有效属性。
+\end{description}
+
+\subsection{垃圾回收器名称}
+
+每个函数可指定垃圾回收器名称，该名称是简单的字符串：
+
+define void @f() gc "name" { ...
+
+编译器声明name的支持值。指定将导致编译器改变其输出的回收器，是为了支持有名的垃圾回收算法。
+
+\subsection{函数属性}
+
+函数属性为增加函数的附加信息而设置。函数属性被视为函数而非函数类型的一部分，因此具有不同参数属性的函数可具有同一函数类型。
+
+函数属性是遵循指定类型的简单关键字。如果需要多个函数属性，则以空格分隔。例如：
+
+define void @f() noinline { ... }
+define void @f() alwaysinline { ... }
+define void @f() alwaysinline optsize { ... }
+define void @f() optsize
+
+\being{description}
+\item[alwaysinline] 该属性表明，内联器试图尽可能将函数内联至调用者，而忽略该调用者的任何活跃的内联大小阈值。
+\item[noinline] 该属性表明，内联器任何情况都不会将函数内联。该属性可能不能与alwaysinline属性一起使用。
+\item[optsize] 该属性建议，优化pass和代码生成器pass在保持函数少代码量还是执行特定优化以减少代码大小间做决定。
+\item[noreturn] 该属性表明
+\item[nounwind]
+\item[readnone]
+\item[readonly]
+\item[ssp]
+\item[sspreq]
+\item[noredzone]
+\item[noimplicitfloat]
+\item[naked]
+\end{description}
+
+\subsection{模块级的内联汇编}
+
+模块可能包含"模块级的内联汇编"块，这对应GCC的"文件作用域的内联汇编"块。这些块由LLVM内部链接起来，并被视为单一单元，但在需要时可在.ll文件中分开。语法很简单：
+
+module asm "inline asm code goes here"
+module asm "more can go here"
+
+字符可包含除非打印字符外的任何字符。例外序列可简单地使用"\\xx"表示，其中"xx"是数字的2位十六进制码。
+
+当生成汇编代码时，内联汇编代码简单地打印至机器代码.s文件。
+
+\subsection{数据布局}
+
+模块可指定目标平台具体的数据布局字符串，该串指定数据如何在内存布局。数据布局的语法很简单：
+
+target datalayout = "layout specification"
+
+布局说明由一系列以减号（"-"）分隔的说明组成。每个说明以字符起始，并在起始字符后包含其它信息以定义数据布局。接受的说明如下：
+
+\begin{description}
+\item[E]
+\item[e]
+\item[p:size:abi:pref]
+\item[isize:abi:pref]
+\item[vsize:abi:pref]
+\item[fsize:abi:pref]
+\item[asize:abi:pref]
+\item[ssize:abi:pref]
+\end{description}
+
+构造给定目标平台的数据布局时，LLVM以默认的说明起始，之后再（可能）由数据布局关键字的说明重载。默认的说明如该列表给定：
+
+\begin{itemize}
+\item E - 大端方式
+\item p:32:64:64 - 32位指针以64位对齐
+\item i1:8:8 - i1以8位（字节）对齐
+\item i8:8:8 - i8以8位（字节）对齐
+\item ii16:16:16 - i16以16位对齐
+\item ii32:32:32 - i32以32位对齐
+\item ii64:32:64 - i64的ABI以32位对齐，但首选以64位对齐
+\item if32:32:32 - float以32位对齐
+\item if64:64:64 - double以64位对齐
+\item iv64:64:64 - 64位向量以64位对齐
+\item iv128:128:128 - 128位向量以128位对齐
+\item ia0:0:1 - 集合（aggregates）以8位对齐
+\item is0:64:64 - 栈对象以64位对齐
+\end{itemize}
+
+LLVM决定给定类型的对齐时，使用下列规则：
+
+\begin{enumerate}
+\item 若类型查找与说明之一完全匹配，则使用该说明。
+\item 如果没有匹配项，且类型查找是整数类型，则使用比查找类型的位宽大的最小整数类型。例如，给定上述默认说明，i7类型将使用i8（下一个最大的）对齐，而i65和i265将均使用i64（特定最大的）对齐。
+\item 如果没有匹配项，且类型查找是向量类型，则将以回退方式，使用比查找向量类型小的最大向量类型作为。例如，<128 x double>可用64个<2 x double>实现。
+\end{enumerate}
+
+\subsection{指针别名规则}
+
+任何内存访问必须通过与内存访问地址范围内关联的指针值实现，否则其行为未定义。与地址范围关联的指针值按照如下规则：
+
+\begin{itemize}
+\item 来自getelementptr指令形成的指针值，与getelementptr首个操作数关联的地址有关。
+\item 全局变量的地址与变量存储的地址范围有关。
+\item 存储分配（allocation）指令的结果值，与分配存储空间的地址范围有关。
+\item 默认地址空间的空指针没有地址与之关联。
+\item 由inttoptr形成的指针值，与所有对指针值计算有（直接或间接）作用的指针值所有地址范围有关。
+\item bitcast的结果值，与bitcast操作数关联的所有地址有关。
+\item 除零或非LLVM定义的函数返回的指针值外的整数常量，与通过非LLVM提供的机制分配的地址范围有关。这样的范围不会与LLVM提供的机制分配的地址范围重合。
+\end{itemize}
+
+LLVM IR的类型与内存无关。load的结果类型仅表明，加载内容的内存大小和对齐，以及值的解释。同理，store的首个操作数仅表明存储空间的大小和对齐。
+
+因此，基于类型的别名分析，aka TBAA，aka -fstrict-aliasing，并不适用于通用朴素的LLVM IR。元数据可用于编码额外信息，该信息特定的优化pass可用于实现基于类型的别名分析。
+
+\section{类型系统}
+
+LLVM类型系统是中间表示最重要的特色之一。作为类型，可使大量的优化直接作用于中间表示，无需在转换前做额外的分析。强类型系统使其更易于阅读生成的代码，并可利用对普通三地址表示并不可行的新颖分析和转换。
+
+\subsection{类型分类}
+
+类型具有一些有用的分类：
+
+\begin{tabular}{|c|c|}
+\hline
+整数 & i1, i2, i3, ... i8, ... i16, ... i32, ... i64, ... \\
+浮点 & float, double, x86\_fp80, fp128, ppc\_fp128 \\
+基本类 & integer, floating point, pointer, vector, structure, array, label, metadata. \\
+初始 & label, void, floating point, metadata. \\
+派生 & integer, array, function, pointer, structure, packed structure, vector, opaque. \\
+\hline
+\end{tabular}
+
+基本类类型可能最重要。这些类型的值只能由指令产生，以参数传递，或用于指令的操作码。
+
+\subsection{初始类型}
+
+初始类型是LLVM系统根本构造块。
+
+\subsubsection{浮点类型}
+
+\begin{tabular}{|c|c|}
+\hline
+类型 & 描述 \\ \hline
+float & 32位浮点值 \\ \hline
+double & 64位浮点值 \\ \hline
+fp128 & 128位浮点值（112位尾数） \\ \hline
+x86\_fp80 & 80位浮点值（X87） \\ \hline
+ppc\_fp128 & 128位浮点值（两个64位） \\ \hline
+\end{tabular}
+
+\subsubsection{void类型}
+
+概述：void类型不表示任何值且没有大小。
+语法：void
+
+\subsubsection{label类型}
+
+概述：label类型表示代码标号。
+语法：label
+
+\subsubsection{metadata类型}
+
+概述：metadata类型表示内嵌的元数据。只有包含元数据的派生类型是metadata* 或返回的函数类型或使用metadata类型的参数，而非指向metadata类型的指针。
+语法：metadata
+
+\subsection{派生类型}
+
+LLVM真正强大之处来自系统的派生类型。这允许程序员表示数组、函数、指针以及其它有用的类型。记住，这些派生类型可递归：例如，产生二维数组是可能的。
+
+\subsubsection{整数类型}
+
+概述：整数类型是非常简单的派生类型，简单地指名所需整数类型的任意位宽即可。从1位至x\^23-1（约8百万）的任意位都可指定。
+
+语法：iN
+整数的位值由N值指定。
+
+示例：
+
+\begin{tabular}{rr}
+i1 & 1位整数 \\
+i32 & 32位整数 \\
+i1942652 & 一个超过1百万位的相当大的整数 \\
+\end{tabular}
+
+记住，代码生成器还不支持作为函数返回类型的大整数类型。代码生成器当前可处理的返回值类型大小的特定限制是与目标平台相关的；当前对于32位目标平台常为64位，而64位目标平台为128位。
+
+\subsubsection{数组类型}
+
+概述：数组类型是个很简单的派生类型，该类型在内存顺序安排元素。数组类型需要一个大小（元素个数）和一个基础的数据类型。
+
+语法： [<# elements> x <elementtype>]
+元素个数是个整数值常量；elementtype可为具有大小的任意类型。
+
+示例：
+
+\begin{tabular}{rr}
+[40 x i32] & 40个32位整数值的数组 \\
+[41 x i32] & 41个32位整数值的数组 \\
+[4 x i8] & 4个8位整数值的数组 \\
+\end{tabular}
+
+这是一些多维数组的示例：
+\begin{tabular}{rr}
+[3 x [4 x i32]] & 3x4个32位整数值的数组 \\
+[12 x [10 x float]] & 12x10个单精度浮点值的数组 \\
+[2 x [3 x [4 x i16]]] & 2x3x4个16位整数值的数组 \\
+\end{tabular}
+
+记住，'变长数组'可通过零长数组实现。通常，访问超出数组尾部在LLVM未定义（例如，访问3元素数组的第5个元素是非法的）。作为特殊情况，零长数组则被认为是可变长的。例如，这允许利用LLVM类型"{ i32, [0 x float]}"实现'pascal样式数组'。
+
+记住，代码生成器还不支持作为函数返回类型的大量聚合类型。代码生成器当前可处理的聚合返回类型大小的特定限制与目标平台相关，还依赖于聚合的元素类型。
+
+\subsubsection{函数类型}
+
+概述：函数类型可认为是作为函数标记。它由返回类型和正式的参数类型列表组成。函数类型的返回类型可为标量类型、void类型或结构类型。若返回类型是结构类型，则所有结构元素必须为基本类类型，且结构至少有一个元素。
+
+语法：<returntype list> (<parameter list>)
+
+...其中'<parameter list>'是由逗号分隔的类型说明符列表。可选地，参数列表可包含...类型，这表明函数获得可变参数。可变参函数可通过可变参处理固有函数访问其参数。'<returntype list>'是以逗号分隔的基本类类型说明符列表。
+
+示例：
+
+\begin{tabular}{rr}
+i32 (i32) & 获得i32，返回i32的函数 \\
+float (i16 signext, i32 *) * & 获得符号扩展的i16和指向i32的指针参数，返回float的函数指针 \\
+i32 (i8*, ...) & 获得至少一个指向i8（C字符）的指针参数，返回整数的可变参函数。这是LLVM的printf标记。\\
+{i32, i32} (i32) & 获得i32，返回两个i32值作为类型{ i32, i32 }的聚合的函数
+\end{tabular}
+
+\subsubsection{结构类型}
+
+概述：结构类型用于表示内存数据成员的集合。定义区域类型的封装，以匹配基础处理器的ABI。结构的元素可为任何有大小的类型。
+
+结构可通过'getelementptr'指令使用'load'和'store'以获得区域的指针指向而访问。
+
+语法：{ <type list> }
+
+示例：
+\begin{tabular}{rr}
+{ i32, i32, i32 } & 三个i32值的三元组 \\
+{ float, i32 (i32) * } & 一对，其中第一个元素是float，第二个元素是指向函数的指针，该函数获得i32而返回i32 \\
+\end{tabular}
+
+记住，代码生成器还不支持作为函数返回类型的大量聚合类型。代码生成器当前可处理的聚合返回类型大小的特定限制与目标平台相关，还依赖于聚合的元素类型。
+
+\subsubsection{封装结构类型}
+
+概述：封装结构类型用于表示内存数据成员的集合。区域间没有填充。而且，封装结构的对齐是1字节。封装结构的元素可为有大小的任何类型。
+
+结构可通过'getelementptr'指令使用'load'和'store'以获得区域的指针指向而访问。
+
+语法：< { <type list> } >
+
+示例：
+\begin{tabular}{rr}
+{ i32, i32, i32 } & 三个i32值的三元组 \\
+{ float, i32 (i32) * } & 一对，其中第一个元素是float，第二个元素是指向函数的指针，该函数获得i32而返回i32 \\
+\end{tabular}
+
+\subsubsection{指针类型}
+
+概述：就像在许多语言中，指针类型表示指向存在于内存的另一个对象的指针或引用。指针类型可具有可选的地址空间属性，该属性定义了指向对象所在的与目标平台特定的编号地址空间。默认的地址空间是零。
+
+记住，LLVM不允许指向void的指针（void*），以及指向指向标号的指针（label*）。使用i8*替代。
+
+语法：<type> *
+
+示例：
+\begin{tabular}{rr}
+[4 x i32]* & 指向四个i32值数组的指针 \\
+i32 (i32 *) * & 指向函数的指针，该函数获得i32*而返回i32 \\
+i32 addrspace(5)* & 指向位于5号地址空间的i32值的指针 \\
+\end{tabular}
+
+\subsubsection{向量类型}
+
+概述：向量类型是简单的派生类型，表示一组元素。向量类型用于使用单指令（SIMD）的多初始数据并行操作。向量类型需要大小（元素个数）和基本初始数据类型。向量长度必须2的幂（1, 2, 4, 8, 16 ...）。向量类型被视为基本类型。
+
+语法：< <# elements> x <elementtype> >
+元素个数是整数值常量；elementtype可为任何整数或浮点类型。
+
+示例：
+\begin{tabular}{rr}
+<4 x i32> & 4个32位整数值的向量 \\
+<8 x float> & 8个32位浮点值的向量 \\
+<2 x i64> & 2个64位整数值的向量 \\
+\end{tabular}
+
+记住，代码生成器还不支持作为函数返回类型的大向量类型。代码生成器当前可处理的向量返回类型大小的特定限制与目标平台有关；当前常有一些比硬件向量寄存器还长的向量类型。
+
+\subsubsection{不透明类型}
+
+概述：不透明类型用于表示系统的未知类型。这对应于（例如）C的前向声明的结构类型记号。LLVM的不透明类型最终解析所有类型（不仅是结构类型）。
+
+语法：opaque
+
+示例：
+\being{tabular}{rr}
+opaque & 不透明类型 \\
+\end{tabular}
+
+\subsection{向上引用的类型}
+
+概述："向上引用"允许引用语句封闭的类型，而无需名称。例如，结构声明可包含指向语句成员的任何类型的指针。向上引用的示例（其等式作为命名的类型声明）包括：
+\begin{tabular}{rr}
+{ \2 * } & \%x = type { \%x* } \\
+{ \2 }* & \%y = type { \%y }* \\
+\1* & \%z = type \%z* \\
+\end{tabular}
+
+当循环中没有类型的声明名称而汇编输出器（asmprinter）输出循环类型时，需要向上引用。因为不愿输出无穷类型字符串，汇编输出器需要一种语法以处理没有名称的循环类型（llvm ir中所有名称都是可选的）。
+
+语法：\<level>
+level是引用的语句类型的计数。
+
+示例：
+\begin{tabular}{rr}
+\1* & 自引用指针 \\
+{ { \3*, i8 }, i32 } & 循环结构，其中upref引用out-most结构 \\
+\end{tabular}
+
+\section{常量}
+
+LLVM具有许多不同的常量基本类型。本节描述所有常量及其语法。
+
+\subsection{简单常量}
+
+\begin{description}
+\item[布尔常量] 'true'和'false'字符串均为有效的i1类型常量。
+\item[整数常量] 标准整数（如'4'）是整数类型的常量。负数可用整数类型表示。
+\item[浮点常量] 浮点常量用于标准十进制记法（如123.421），指数记法（如1.23421e+2），或更多精度的十六进制记法（如下所示）。汇编器需要精确的浮点常量的十进制值。例如，汇编器接受1.25而拒绝1.3，因为二进制中1.3是循环十进制。浮点常量需具有浮点类型。
+\item[空指针常量] 标识符'null'被识别为空指针常量且需为指针类型。
+\end{description}
+
+常量的非直觉记法之一是十六进制形式的浮点常量。
+
+\subsection{复杂常量}
+
+复杂常量是（可能循环）简单常量和更小的复杂常量的组合。
+
+\begin{description}
+\item[结构常量] 
+\item[数组常量] 
+\item[向量常量] 
+\item[零初始化] 
+\item[元数据节点] 
+\end{description}
+
+\subsection{全局变量和函数的地址}
+
+全局变量和函数的地址总是隐式有效（链接时）变量。在使用总是指针类型的全局值标识符时，这些常量显式引用。例如，下面是合法的LLVM文件：
+
+@X = global i32 17
+@Y = global i32 42
+@Z = global [2 x i32*] [ i32* @X, i32* @Y ]
+
+\subsection{未定义的值}
+
+字符串'undef'被识别为无定值的更小类型常量。未定义的值可为任何类型且用于任何常量允许的地方。
+
+未定义的值表明编译器无论使用什么值程序是良好定义的，这给予编译器更多优化的自由。
+
+% subsection 未定义的取值 (end)
+\subsection{常量表达式} % (fold)
+
+常量表达式用于引发（involve）其它常量的作为常量使用的表达式。常量表达式可为任何基本类类型以及引发无副作用的LLVM操作（例如不支持load和call）。下面是常量表达式的语法：
+
+\begin{description}
+\item[trunc ( CST to TYPE)] 
+\item[zext ( CST to TYPE)] 
+\item[sext ( CST to TYPE)] 
+\item[fptrunc ( CST to TYPE)] 
+\item[fpext ( CST to TYPE)] 
+\item[fptoui ( CST to TYPE)] 
+\item[fptosi ( CST to TYPE)] 
+\item[uitofp ( CST to TYPE)] 
+\item[sitofp ( CST to TYPE)] 
+\item[ptrtoint ( CST to TYPE)] 
+\item[inttoptr( CST to TYPE)] 
+\item[bitcast ( CST to TYPE)] 
+\item[getelementptr ( CSTPTR, IDX0, IDX1, ... )]
+\item[getelementptr inbounds ( CSTPTR, IDX0, IDX1, ... )] 
+\item[select ( COND, VAL1, VAL2 )] 
+\item[icmp COND ( VAL1, VAL2 )] 
+\item[fcmp COND ( VAL1, VAL2 )] 
+\item[extractelement ( VAL, IDX )] 
+\item[insertelement ( VAL, ELT, IDX )] 
+\item[shufflevector ( VEC1, VEC2, IDXMASK )] 
+\item[OPCODE ( LHS, RHS )] 
+\end{description}
+% subsection 常量表达式 (end)section{}
+
+\subsection{内嵌的元数据} % (fold)
+
+
+
+% subsection 内嵌的元数据 (end)section{}
+
+\section{其他取值}
+
+\subsection{内联汇编表达式} % (fold)
+
+LLVM通过使用特殊值，支持内联汇编表达式（与模块级内联汇编不同）。该值表示内联汇编为字符串（包含发射的指令），操作约束列表（存储为字符串），和表明内联汇编表达式是否有副作用的标记。内联汇编表达式的示例是：
+
+i32 (i32) asm "bswap \$0", "=r,r"
+
+内联汇编器仅能用作调用指令的被调用者操作数。因此，典型地有以下示例：
+
+\%X = call i32 asm "bswap \$0", "=r,r"(i32 \%Y)
+
+在约束列表不可见的有副作用的内联汇编，必须标记为具有副作用。这通过使用'sideeffect'关键字实现，如下：
+
+call void asm sideeffect "eieio", ""()
+
+TODO：汇编和约束字符串的格式仍需要在此文档化。能完成什么的约束（例如复制、移动等需要文档化）。引用具有完整视角包含内联汇编的其它文档
+，这可能是最好的实现。
+% subsection 内联汇编表达式 (end)
+
+\section{内置全局变量}
+
+LLVM有大量"神奇的"全局变量，该变量包含能影响代码生成或其它IR语义的数据。说明在此。该类的所有全局值应具有"llvm.metadata"指定的段。该节和所有以"llvm."起始的全局值由LLVM保留使用。
+
+\subsection{"llvm.used"全局变量} % (fold)
+
+@llvm.used全局值是具有i8*元素类型（appending链接）的数据。该数组包含指向全局变量和函数的指针列表，指针可能从bitcast或getelementptr转换而来。例如，其合法的用法是：
+
+@X = global i8 4
+@Y = global i32 123
+
+@llvm.used = appending global [2 x i8*] [
+   i8* @X,
+   i8* bitcast (i32* @Y to i8*)
+], section "llvm.metadata"
+
+若全局变量出现在@llvm.used列表，编译器、汇编器和链接器则需视该符号为不可见全局值的引用。例如，若变量具有internal链接且除@llvm.used列表外无引用，该变量不能被删去。这通常用于表示来自内联汇编、编译器不"可见"的其它值，以及与GNU C的"attribute((used))"对应的引用。
+
+在一些目标平台，代码生成器必须发射汇编器或目标文件的命令（directive），以避免汇编器和链接器干扰符号。
+
+% subsection "llvm.used"全局变量 (end)
+\subsection{"llvm.compiler.used"全局变量} % (fold)
+
+@llvm.compiler.used命令除仅避免编译器接触符号外，与@llvm.used命令相同。在支持的目标平台下，这允许智能的链接器优化指向符号的引用，而无需像@llvm.used一样被污染（impede）。
+
+这是少数仅用于少数情况的结构，且不应展现给源语言。
+
+% subsection "llvm.compiler.used"全局变量 (end)section{}
+\subsection{"llvm.global\_ctors"全局变量} % (fold)
+
+TODO：描述该变量。
+
+% subsection "llvm.global\_ctors"全局变量 (end)
+\subsection{"llvm.global\_dtors"全局变量} % (fold)
+
+TODO：描述该变量。
+% subsection "llvm.global\_dtors"全局变量 (end)
+
+\section{指令参考} % (fold)
+
+LLVM指令集由许多不同的指令分类组成：终止指令、二进制指令、位二进制指令、内存指令和其它指令。
+
+\subsection{终止指令} % (fold)
+
+如前述，程序的每个基本块以"终止"指令终结，这表明当前块结束后该执行的块。这些终止指令典型地产生'void'值：其生成控制流而非值（除'invoke'指令外）。
+
+这有六种不同的终止指令：'ret'指令、'br'指令、'switch'指令、'invoke'指令、'unwind'指令和'unreachable'指令。
+
+\subsubsection{'ret'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'ret'指令 (end)
+
+\subsubsection{'br'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'br'指令 (end)
+
+\subsubsection{'switch'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'switch'指令 (end)
+
+\subsubsection{'invoke'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'invoke'指令 (end)
+
+\subsubsection{'unwind'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'unwind'指令 (end)
+
+\subsubsection{'unreachable'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'unreachable'指令 (end)
+% subsection 终止指令 (end)
+
+\subsection{二进制指令}
+
+二进制操作用于完成绝大多数程序计算。该操作需要两个相同类型的操作数、执行在操作数的操作，并生成单值。操作数可为多数据，例如向量数据类型。结果的值与其操作数具有同一类型。
+
+这有许多不同的二进制操作：
+
+\subsubsection{'add'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'add'指令 (end)
+
+\subsubsection{'fadd'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fadd'指令 (end)
+
+\subsubsection{'sub'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'sub'指令 (end)
+
+\subsubsection{'fsub'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fsub'指令 (end)
+
+\subsubsection{'mul'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'mul'指令 (end)
+
+\subsubsection{'fmul'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fmul'指令 (end)
+
+\subsubsection{'udiv'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'udiv'指令 (end)
+
+\subsubsection{'sdiv'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'sdiv'指令 (end)
+
+\subsubsection{'fdiv'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fdiv'指令 (end)
+
+\subsubsection{'urem'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'urem'指令 (end)
+
+\subsubsection{'srem'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'srem'指令 (end)
+
+\subsubsection{'frem'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'frem'指令 (end)
+
+\subsection{位二进制操作}
+
+位二进制操作用于完成程序位翻转（bit-twiddling）的各种形式。该操作普遍是非常高效的指令，且通常从其它指令精简产生。该操作需要两个相同类型的操作数，执行在操作数上的操作，并产生单值。结果的值与操作数是同一类型。
+
+\subsubsection{'shl'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'shl'指令 (end)
+
+\subsubsection{'lshr'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'lshr'指令 (end)
+
+\subsubsection{'ashr'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'ashr'指令 (end)
+
+\subsubsection{'and'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'and'指令 (end)
+
+\subsubsection{'or'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'or'指令 (end)
+
+\subsubsection{'xor'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'xor'指令 (end)
+
+\subsection{向量操作}
+
+LLVM支持许多以目标平台无关方式表示的向量操作指令。这些指令包括需要有效处理向量的元素访问和向量特殊操作。虽然LLVM确实直接支持这些向量操作，许多高级（sophisticated）算法希望使用目标平台相关的固有属性以获得特定目标平台全部优势。
+
+\subsubsection{'extractelement'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'extractelement'指令 (end)
+
+\subsubsection{'insertelement'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'insertelement'指令 (end)
+
+\subsubsection{'shufflevector'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'shufflevector'指令 (end)
+
+\subsection{聚合操作}
+
+LLVM支持许多作用在聚合值的指令。
+
+\subsubsection{'extractvalue'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'extractvalue'指令 (end)
+
+\subsubsection{'insertvalue'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'insertvalue'指令 (end)
+
+\subsection{访存和寻址指令}
+
+基于SSA表示的一个关键设计点是怎样表示内存。LLVM中，没有内存位置是SSA形式的，这使事情变得很简单。该节描述在LLVM怎样读取、写入、分配和释放内存。
+
+\subsubsection{'malloc'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'malloc'指令 (end)
+
+\subsubsection{'free'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'free'指令 (end)
+
+\subsubsection{'alloca'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'alloca'指令 (end)
+
+\subsubsection{'load'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'load'指令 (end)
+
+\subsubsection{'store'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'store'指令 (end)
+
+\subsubsection{'getelementptr'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'getelementptr'指令 (end)
+
+\subsection{转换（conversion）指令}
+
+该分类的指令是转换指令（强转casting），所有指令获得单操作数和类型参数。该类指令执行大量操作数的位转换。
+
+\subsubsection{'trunc .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'trunc .. to'指令 (end)
+
+\subsubsection{'zext .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'zext .. to'指令 (end)
+
+\subsubsection{'sext .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'sext .. to'指令 (end)
+
+\subsubsection{'fptrunc .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fptrunc .. to'指令 (end)
+
+\subsubsection{'fpext .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fpext .. to'指令 (end)
+
+\subsubsection{'fptoui .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fptoui .. to'指令 (end)
+
+\subsubsection{'fptosi .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fptosi .. to'指令 (end)
+
+\subsubsection{'uitofp .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'uitofp .. to'指令 (end)
+
+\subsubsection{'sitofp .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'sitofp .. to'指令 (end)
+
+\subsubsection{'ptrtoint .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'ptrtoint .. to'指令 (end)
+
+\subsubsection{'inttoptr .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'inttoptr .. to'指令 (end)
+
+\subsubsection{'bitcast .. to'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'bitcast .. to'指令 (end)
+
+\subsection{其它操作}
+
+该类指令是"各种各样的"（miscellaneous）指令，其没有更好的分类。
+
+\subsubsection{'icmp'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'icmp'指令 (end)
+
+\subsubsection{'fcmp'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'fcmp'指令 (end)
+
+\subsubsection{'phi'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'phi'指令 (end)
+
+\subsubsection{'select'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'select'指令 (end)
+
+\subsubsection{'va\_arg'指令} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'va_arg'指令 (end)
+
+% section 指令参考 (end)
+
+\section{固有（intrinsic）函数}
+
+LLVM支持"固有函数"记号。这些函数具有熟知的名称和语义，且用于满足固定限制（restriction）。总体来说，这些固有函数代表了LLVM语言的扩展机制，当向语言（或比特码读写器、词法程序等）增加固有函数时，无需更改LLVM的所有转换（transformation）。
+
+所有固有函数名称必须以"llvm."前缀起始。该前缀为LLVM固有名称而保留；因此，函数名称可能不以该前缀起始。固有函数必须总是外部函数：不能定义固有函数体。固有函数仅能用在call或invoke指令：获得固有函数的地址是非法的。
+
+此外，由于固有函数是LLVM语言的一部分，若有任何的增加应需在此文档化。
+
+一些固有函数可重载，例如，表示函数族（执行同一操作但作用于不同数据类型）的固有函数。由于LLVM可表示超过8百万不同的整数类型，重载通常用于可操作任何整数类型的固有函数。一个或多个参数类型或结果的类型可重载以接受任何整数类型。参数类型也可定义为与先前参数类型或结构类型完全匹配的类型。这使接受多参数但要求所有参数为同一类型的固有函数，仅可以单一参数或结果重载。
+
+重载的固有函数将其重载的参数类型名称编码至其函数名称，每个按时间顺序。仅有重载的类型导致名称后缀。与其它类型匹配的参数并非如此。例如，llvm.ctpop函数获得任意宽度的整数，返回同样宽度的整数。这引出如 i8 @llvm.ctpop.i8(i8 \%val) 和 i29 @llvm.ctpop.i29(i29 \%val) 等函数族。仅有一个参数类型和返回类型的重载，只需一个类型类型的前缀。因为参数类型与返回类型匹配，该函数无需其拥有的名称后缀。
+
+学习怎样增加固有函数，详见"扩展LLVM指导"。
+
+\subsection{可变参处理固有函数}
+
+可变参数支持在LLVM通过va\_arg指令和三种固有函数定义。这些函数与定义在<stdarg.h>头文件中的命名相似的宏有关。
+
+所有这些函数，操作的参数使用的是与目标平台相关的值类型"va\_list"。LLVM汇编语言参考指南没定义"va\_list"是什么类型，因此所有转换应为处理这些函数做准备，无论使用的是什么类型。
+
+该示例展示了va\_arg指令和可变参处理固有函数的使用。
+
+define i32 @test(i32 \%X, ...) {
+  ; Initialize variable argument processing
+  \%ap = alloca i8*
+  \%ap2 = bitcast i8** %ap to i8*
+  call void @llvm.va\_start(i8* %ap2)
+
+  ; Read a single integer argument
+  \%tmp = va\_arg i8** %ap, i32
+
+  ; Demonstrate usage of llvm.va\_copy and llvm.va\_end
+  \%aq = alloca i8*
+  \%aq2 = bitcast i8** \%aq to i8*
+  call void @llvm.va\_copy(i8* \%aq2, i8* \%ap2)
+  call void @llvm.va\_end(i8* \%aq2)
+
+  ; Stop processing of arguments.
+  call void @llvm.va\_end(i8* \%ap2)
+  ret i32 \%tmp
+}
+
+declare void @llvm.va\_start(i8*)
+declare void @llvm.va\_copy(i8*, i8*)
+declare void @llvm.va\_end(i8*)
+
+\subsubsection{'llvm.va\_start'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.va\_start'固有函数 (end)
+
+\subsubsection{'llvm.va\_end'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.va\_end'固有函数 (end)
+
+\subsubsection{'llvm.va\_copy'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.va\_copy'固有函数 (end)
+
+\subsection{精确垃圾回收固有函数}
+
+LLVM支持的精确垃圾回收（GC）需要这些固有函数的实现和生成。这些固有函数允许GC根植于栈的标识符，垃圾回收器的实现还需要读取和写入栅栏（barrier）。类型安全具有垃圾回收功能的语言的前后端应生成这些固有函数，以利用LLVM垃圾回收器。更多的细节，详见LLVM的精确垃圾回收。
+
+垃圾回收固有函数仅操作位于普通地址空间（地址空间零）的对象。
+
+\subsubsection{'llvm.gcroot'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.gcroot'固有函数 (end)
+
+\subsubsection{'llvm.gcread'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.gcread'固有函数 (end)
+
+\subsubsection{'llvm.gcwrite'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.gcwrite'固有函数 (end)
+
+\subsection{代码生成固有函数}
+
+LLVM提供这些固有函数以展现仅由具有代码生成器支持实现的特性。
+
+\subsubsection{'llvm.returnaddress'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.returnaddress'固有函数 (end)
+
+\subsubsection{'llvm.frameaddress'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.frameaddress'固有函数 (end)
+
+\subsubsection{'llvm.stacksave'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.stacksave'固有函数 (end)
+
+\subsubsection{'llvm.stackrestore'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.stackrestore'固有函数 (end)
+
+\subsubsection{'llvm.prefetch'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.prefetch'固有函数 (end)
+
+\subsubsection{'llvm.pcmarker'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.pcmarker'固有函数 (end)
+
+\subsubsection{'llvm.readcyclecounter'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.readcyclecounter'固有函数 (end)
+
+\subsection{标准C库固有函数}
+
+LLVM提供一些重要的标准C库函数的固有函数。这些固有函数允许源语言前后端以传递关于代码生成器指针参数的对齐的信息，提供更有效的代码生成。
+
+\subsubsection{'llvm.mencpy'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.memcpy'固有函数 (end)
+
+\subsubsection{'llvm.memmove'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.memmove'固有函数 (end)
+
+\subsubsection{'llvm.memset.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.memset.*'固有函数 (end)
+
+\subsubsection{'llvm.sqrt.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.sqrt.*'固有函数 (end)
+
+\subsubsection{'llvm.powi.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.powi.*'固有函数 (end)
+
+\subsubsection{'llvm.sin.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.sin.*'固有函数 (end)
+
+\subsubsection{'llvm.cos.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.cos.*'固有函数 (end)
+
+\subsubsection{'llvm.pow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.pow.*'固有函数 (end)
+
+\subsection{位操作（manipulation）固有函数}
+
+LLVM提供一些重要的位操作固有函数。这允许一些算法的有效代码生成。
+
+\subsubsection{'llvm.bswap.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+语义：
+
+% subsubsection 'llvm.bswap.*'固有函数 (end)
+
+\subsubsection{'llvm.ctpop.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.ctpop.*'固有函数 (end)
+
+\subsubsection{'llvm.ctlz.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.ctlz.*'固有函数 (end)
+
+\subsubsection{'llvm.cttz.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.cttz.*'固有函数 (end)
+
+\subsection{带溢出的算术固有函数}
+
+LLVM提供一些带溢出操作的算术固有函数。
+
+\subsubsection{'llvm.sadd.with.overflow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.sadd.with.overflow.*'固有函数 (end)
+
+\subsubsection{'llvm.uadd.with.overflow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.uadd.with.overflow.*'固有函数 (end)
+
+\subsubsection{'llvm.ssub.with.overflow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.ssub.with.overflow.*'固有函数 (end)
+
+\subsubsection{'llvm.usub.with.overflow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.usub.with.overflow.*'固有函数 (end)
+
+\subsubsection{'llvm.smul.with.overflow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.smul.with.overflow.*'固有函数 (end)
+
+\subsubsection{'llvm.umul.with.overflow.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.umul.with.overflow.*'固有函数 (end)
+
+\subsection{调试器固有函数}
+
+LLVM调试器固有函数（所有以llvm.dbg前缀起始），在LLVM源码级调试文档中描述。
+
+\subsection{异常处理固有函数}
+
+LLVM异常处理固有函数（所有以llvm.eh前缀起始），在LLVM异常处理文档中描述。
+
+\subsection{蹦床（Trampoline）固有函数}
+
+该固有函数使之成为可能：从函数删去（excise）标记为嵌套属性的参数。其结果是可调用的函数指针缺少嵌套参数 - 调用者无需提供该参数值。作为替代，使用的值预先存储在"蹦床"（通常栈分配的一块内存），这也包含接合（splice）嵌套值至参数列表的代码。这用于实现GCC嵌套函数地址扩展。
+
+例如，如果函数是 i32 f(i8* nest \%c, i32 \%x, i32 \%y) ，则产生的函数指针具有 i32 (i32, i32)* 标记。它可如下创建：
+
+\%tramp = alloca [10 x i8], align 4 ; size and alignment only correct for X86
+\%tramp1 = getelementptr [10 x i8]* \%tramp, i32 0, i32 0
+\%p = call i8* @llvm.init.trampoline( i8* \%tramp1, i8* bitcast (i32 (i8* nest , i32, i32)* @f to i8*), i8* \%nval )
+\%fp = bitcast i8* \%p to i32 (i32, i32)*
+
+调用 \%val = call i32 \%fp( i32 \%x, i32 \%y ) ，则等价于 \%val = call i32 \%f( i8* \%nval, i32 \%x, i32 \%y ) 。
+
+\subsubsection{'llvm.init.trampoline'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.init.trampoline'固有函数 (end)
+
+\subsection{原子操作和同步固有函数}
+
+这些固有函数扩展LLVM的"通用IR"，以表示原子操作和内存同步的硬件构造。这提供硬件接口，而非程序员接口。其目的在于足够低的层级，以允许任何需要清晰映射原子行为的编程模型或API（程序编程接口）。这也主要模拟硬件行为。正像硬件提供源语言的"通用IR"一样，硬件还提供不断发展的"通用"原子操作和同步IR的起点。
+
+这些固有函数并不形成如下API：高层线程库，软件事务内存系统，原子原语和来自BSD、GNU libc、atomic\_ops、APR及其它系统和应用库的固有函数。LLVM提供的硬件接口可允许所有这些API和并行编程模型的干净实现。除非硬件本身普遍如此，没有模型或范例可选择上述其它的API。
+
+
+\subsubsection{'llvm.memory.barrier'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.memory.barrier'固有函数 (end)
+
+\subsubsection{'llvm.atomic.cmp.swap.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.atomic.cmp.swap.*'固有函数 (end)
+
+\subsubsection{'llvm.atomic.swap.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.atomic.swap.*'固有函数 (end)
+
+\subsubsection{'llvm.atomic.load.add.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.atomic.load.add.*'固有函数 (end)
+
+\subsubsection{'llvm.atomic.load.sub.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.atomic.load.sub.*'固有函数 (end)
+
+\subsubsection{'llvm.atomic.load.and/nand/or/xor.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.atomic.load.and/nand/or/xor.*'固有函数 (end)
+
+\subsubsection{'llvm.atomic.load.max/min/umax/umin.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+示例：
+
+% subsubsection 'llvm.atomic.load.max/min/umax/umin.*'固有函数 (end)
+
+\subsection{通用固有函数}
+
+该类通用固有函数为通用和非专有目的而设计。
+
+\subsubsection{'llvm.var.annotation'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.var.annotation'固有函数 (end)
+
+\subsubsection{'llvm.annotation.*'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.annotation.*'固有函数 (end)
+
+\subsubsection{'llvm.trap'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.trap'固有函数 (end)
+
+\subsubsection{'llvm.stackprotector'固有函数} % (fold)
+
+语法：
+
+概述：
+
+参数：
+
+语义：
+
+% subsubsection 'llvm.stackprotector'固有函数 (end)
+
+\end{document}
